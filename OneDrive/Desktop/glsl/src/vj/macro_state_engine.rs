@@ -1,6 +1,8 @@
 use anyhow::Result;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use crate::params::{PatternType, PaletteType, ColorMode, ShaderParams};
 
 /// Macro-State Engine - The brain of the autonomous VJ
@@ -43,6 +45,44 @@ pub struct MacroStateEngine {
     min_pattern_duration: Duration,
     max_pattern_duration: Duration,
     transition_probability: f32,
+
+    // Uniqueness tracking for AI-generated animations
+    used_combinations: HashSet<u64>,
+    current_variation_seed: u64,
+    random_state: u64,
+    param_modifiers: ParamModifiers,
+}
+
+/// Random parameter modifiers for unique animations
+#[derive(Debug, Clone, Copy)]
+pub struct ParamModifiers {
+    pub frequency_mult: f32,
+    pub speed_mult: f32,
+    pub amplitude_mult: f32,
+    pub scale_mult: f32,
+    pub brightness_mult: f32,
+    pub contrast_mult: f32,
+    pub saturation_mult: f32,
+    pub hue_shift: f32,
+    pub rotation_offset: f32,
+    pub distort_mult: f32,
+}
+
+impl Default for ParamModifiers {
+    fn default() -> Self {
+        Self {
+            frequency_mult: 1.0,
+            speed_mult: 1.0,
+            amplitude_mult: 1.0,
+            scale_mult: 1.0,
+            brightness_mult: 1.0,
+            contrast_mult: 1.0,
+            saturation_mult: 1.0,
+            hue_shift: 0.0,
+            rotation_offset: 0.0,
+            distort_mult: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,10 +139,95 @@ impl MacroStateEngine {
             pattern_history: VecDeque::with_capacity(10),
             palette_history: VecDeque::with_capacity(10),
             transition_history: VecDeque::with_capacity(20),
-            
+
             min_pattern_duration: Duration::from_secs(8),
             max_pattern_duration: Duration::from_secs(45),
             transition_probability: 0.3,
+
+            // Initialize uniqueness tracking with time-based seed
+            used_combinations: HashSet::new(),
+            current_variation_seed: Instant::now().elapsed().as_nanos() as u64,
+            random_state: Instant::now().elapsed().as_nanos() as u64,
+            param_modifiers: ParamModifiers::default(),
+        }
+    }
+
+    /// Generate next pseudo-random number (xorshift64)
+    fn next_random(&mut self) -> u64 {
+        let mut x = self.random_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.random_state = x;
+        x
+    }
+
+    /// Generate random f32 in range [min, max]
+    fn random_range(&mut self, min: f32, max: f32) -> f32 {
+        let random = self.next_random();
+        let normalized = (random % 10000) as f32 / 10000.0;
+        min + normalized * (max - min)
+    }
+
+    /// Generate unique combination hash for tracking
+    fn generate_combination_hash(&self, pattern: PatternType, palette: PaletteType, modifiers: &ParamModifiers) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        format!("{:?}", pattern).hash(&mut hasher);
+        format!("{:?}", palette).hash(&mut hasher);
+        // Include key modifiers in hash (rounded to reduce precision)
+        ((modifiers.frequency_mult * 10.0) as i32).hash(&mut hasher);
+        ((modifiers.speed_mult * 10.0) as i32).hash(&mut hasher);
+        ((modifiers.hue_shift * 10.0) as i32).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Generate new random parameter modifiers ensuring uniqueness
+    fn generate_unique_modifiers(&mut self) -> ParamModifiers {
+        const MAX_ATTEMPTS: usize = 50;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let modifiers = ParamModifiers {
+                frequency_mult: self.random_range(0.5, 2.5),
+                speed_mult: self.random_range(0.3, 2.0),
+                amplitude_mult: self.random_range(0.5, 2.0),
+                scale_mult: self.random_range(0.7, 1.5),
+                brightness_mult: self.random_range(0.8, 1.4),
+                contrast_mult: self.random_range(0.7, 1.6),
+                saturation_mult: self.random_range(0.6, 1.5),
+                hue_shift: self.random_range(0.0, 1.0),
+                rotation_offset: self.random_range(0.0, std::f32::consts::TAU),
+                distort_mult: self.random_range(0.5, 2.0),
+            };
+
+            let hash = self.generate_combination_hash(
+                self.current_pattern,
+                self.current_palette,
+                &modifiers,
+            );
+
+            if !self.used_combinations.contains(&hash) {
+                self.used_combinations.insert(hash);
+                // Clean old combinations to prevent memory growth (keep last 1000)
+                if self.used_combinations.len() > 1000 {
+                    self.used_combinations.clear();
+                    self.used_combinations.insert(hash);
+                }
+                return modifiers;
+            }
+        }
+
+        // Fallback: return random modifiers even if not unique
+        ParamModifiers {
+            frequency_mult: self.random_range(0.5, 2.5),
+            speed_mult: self.random_range(0.3, 2.0),
+            amplitude_mult: self.random_range(0.5, 2.0),
+            scale_mult: self.random_range(0.7, 1.5),
+            brightness_mult: self.random_range(0.8, 1.4),
+            contrast_mult: self.random_range(0.7, 1.6),
+            saturation_mult: self.random_range(0.6, 1.5),
+            hue_shift: self.random_range(0.0, 1.0),
+            rotation_offset: self.random_range(0.0, std::f32::consts::TAU),
+            distort_mult: self.random_range(0.5, 2.0),
         }
     }
     
@@ -289,12 +414,12 @@ impl MacroStateEngine {
     fn initiate_transition(&mut self) -> Result<()> {
         self.transition_in_progress = true;
         self.transition_start_time = Instant::now();
-        
+
         // Select new pattern and palette
         let new_pattern = self.select_next_pattern()?;
         let new_palette = self.select_next_palette()?;
         let new_color_mode = self.select_next_color_mode()?;
-        
+
         // Record transition
         let transition = TransitionEvent {
             from_pattern: self.current_pattern,
@@ -304,20 +429,24 @@ impl MacroStateEngine {
             trigger: self.determine_transition_trigger(),
             timestamp: Instant::now(),
         };
-        
+
         self.transition_history.push_back(transition);
         if self.transition_history.len() > 20 {
             self.transition_history.pop_front();
         }
-        
+
         // Update current state
         self.current_pattern = new_pattern;
         self.current_palette = new_palette;
         self.current_color_mode = new_color_mode;
-        
+
+        // Generate unique parameter modifiers for this animation
+        self.param_modifiers = self.generate_unique_modifiers();
+        self.current_variation_seed = self.next_random();
+
         // Add to blacklist
         self.add_to_blacklist();
-        
+
         Ok(())
     }
     
@@ -575,84 +704,98 @@ impl MacroStateEngine {
         }
     }
     
-    /// Get intelligent parameter randomization based on mood (EXPLOSIVE reactivity)
+    /// Get intelligent parameter randomization based on mood (UNIQUE animations)
     pub fn get_randomized_params(&self, base_params: &ShaderParams) -> ShaderParams {
         let mut params = base_params.clone();
-        
-        // EXPLOSIVE time-based variation
+
+        // Apply unique modifiers generated at transition time
+        let mods = &self.param_modifiers;
+        params.frequency *= mods.frequency_mult;
+        params.speed *= mods.speed_mult;
+        params.amplitude *= mods.amplitude_mult;
+        params.scale *= mods.scale_mult;
+        params.brightness *= mods.brightness_mult;
+        params.contrast *= mods.contrast_mult;
+        params.saturation *= mods.saturation_mult;
+        params.hue += mods.hue_shift;
+        params.camera_rotation += mods.rotation_offset;
+        params.distort_amplitude *= mods.distort_mult;
+
+        // Time-based animation (uses unique seed for variation)
         let time = std::time::Instant::now().elapsed().as_secs_f32();
-        
+        let seed_offset = (self.current_variation_seed % 1000) as f32 / 100.0;
+
         match self.mood {
             MusicMood::Ambient => {
-                // EXPLOSIVE gentle variations with dramatic pulsing
-                let pulse = 0.5 + 0.8 * (2.0 * std::f32::consts::PI * 0.3 * time).sin().abs();
-                let wave = 1.0 + 0.5 * (2.0 * std::f32::consts::PI * 0.1 * time).sin();
-                params.frequency *= pulse * wave;
-                params.speed *= 0.2 + (self.energy_level * 0.6) * pulse;
-                params.amplitude *= 0.4 + (self.energy_level * 1.2) * pulse;
-                params.brightness *= pulse;
-                params.contrast *= wave;
+                // Gentle flowing animations with unique phase
+                let pulse = 0.8 + 0.4 * (2.0 * std::f32::consts::PI * 0.2 * (time + seed_offset)).sin();
+                let wave = 1.0 + 0.3 * (2.0 * std::f32::consts::PI * 0.15 * (time + seed_offset * 2.0)).sin();
+                params.frequency *= pulse;
+                params.speed *= 0.3 + (self.energy_level * 0.4) * wave;
+                params.amplitude *= wave;
+                params.brightness *= 0.9 + 0.2 * pulse;
             },
             MusicMood::Energetic => {
-                // EXPLOSIVE fast variations with beat synchronization
-                let beat_pulse = 1.0 + 1.0 * (2.0 * std::f32::consts::PI * 3.0 * time).sin().abs();
-                let explosion = 1.0 + 0.8 * (2.0 * std::f32::consts::PI * 0.2 * time).sin();
-                params.frequency *= 1.5 + (self.energy_level * 1.0) * beat_pulse;
-                params.speed *= 1.0 + (self.energy_level * 0.8) * beat_pulse;
-                params.amplitude *= 1.2 + (self.energy_level * 1.0) * beat_pulse;
-                params.contrast *= beat_pulse * explosion;
+                // Fast, reactive animations with unique rhythm
+                let beat_pulse = 1.0 + 0.8 * (2.0 * std::f32::consts::PI * 2.5 * (time + seed_offset)).sin().abs();
+                let explosion = 1.0 + 0.5 * (2.0 * std::f32::consts::PI * 0.3 * (time + seed_offset * 1.5)).sin();
+                params.frequency *= 1.2 + (self.energy_level * 0.8) * beat_pulse;
+                params.speed *= 0.8 + (self.energy_level * 0.6) * beat_pulse;
+                params.amplitude *= beat_pulse;
+                params.contrast *= 1.0 + 0.4 * explosion;
                 params.saturation *= explosion;
             },
             MusicMood::Melodic => {
-                // EXPLOSIVE balanced variations with harmonic modulation
-                let harmonic = 0.8 + 0.6 * (2.0 * std::f32::consts::PI * 0.8 * time).sin().abs();
-                let melody_wave = 1.0 + 0.4 * (2.0 * std::f32::consts::PI * 0.3 * time).sin();
+                // Harmonic, balanced animations
+                let harmonic = 0.9 + 0.3 * (2.0 * std::f32::consts::PI * 0.6 * (time + seed_offset)).sin();
+                let melody_wave = 1.0 + 0.25 * (2.0 * std::f32::consts::PI * 0.4 * (time + seed_offset * 0.7)).sin();
                 params.frequency *= harmonic;
-                params.speed *= 0.4 + (self.energy_level * 0.5) * melody_wave;
-                params.amplitude *= 0.6 + (self.energy_level * 0.8) * harmonic;
-                params.saturation *= harmonic * melody_wave;
-                params.brightness *= melody_wave;
+                params.speed *= 0.5 + (self.energy_level * 0.4) * melody_wave;
+                params.amplitude *= 0.8 + (self.energy_level * 0.6) * harmonic;
+                params.saturation *= melody_wave;
+                params.brightness *= 0.95 + 0.1 * harmonic;
             },
             MusicMood::Rhythmic => {
-                // EXPLOSIVE beat-synchronized variations
-                let rhythm = 1.0 + 0.8 * (2.0 * std::f32::consts::PI * 2.0 * time).sin().abs();
-                let beat_wave = 1.0 + 0.6 * (2.0 * std::f32::consts::PI * 0.5 * time).sin();
-                params.frequency *= 1.2 + (self.energy_level * 0.6) * rhythm;
-                params.speed *= 0.8 + (self.energy_level * 0.4) * rhythm;
-                params.amplitude *= 1.0 + (self.energy_level * 0.6) * rhythm;
-                params.scale *= rhythm * beat_wave;
+                // Beat-synchronized with unique timing
+                let rhythm = 1.0 + 0.6 * (2.0 * std::f32::consts::PI * 1.8 * (time + seed_offset)).sin().abs();
+                let beat_wave = 1.0 + 0.4 * (2.0 * std::f32::consts::PI * 0.6 * (time + seed_offset * 1.3)).sin();
+                params.frequency *= rhythm;
+                params.speed *= 0.6 + (self.energy_level * 0.5) * rhythm;
+                params.amplitude *= beat_wave;
+                params.scale *= 0.9 + 0.2 * rhythm;
                 params.contrast *= beat_wave;
             },
             MusicMood::Chaotic => {
-                // EXPLOSIVE extreme, unpredictable variations
-                let chaos = 0.3 + 1.4 * (2.0 * std::f32::consts::PI * 5.0 * time).sin().abs();
-                let madness = 1.0 + 0.8 * (2.0 * std::f32::consts::PI * 0.1 * time).sin();
+                // Unpredictable, wild animations
+                let chaos = 0.5 + 1.2 * (2.0 * std::f32::consts::PI * 4.0 * (time + seed_offset)).sin().abs();
+                let madness = 1.0 + 0.6 * (2.0 * std::f32::consts::PI * 0.15 * (time + seed_offset * 3.0)).sin();
                 params.frequency *= chaos;
-                params.speed *= 0.1 + (self.energy_level * 1.2) * chaos;
-                params.amplitude *= 0.2 + (self.energy_level * 2.0) * chaos;
-                params.distort_amplitude *= chaos * madness;
-                params.noise_strength *= madness;
+                params.speed *= 0.2 + (self.energy_level * 1.0) * chaos;
+                params.amplitude *= 0.4 + (self.energy_level * 1.5) * chaos;
+                params.distort_amplitude *= madness;
+                params.noise_strength *= 0.8 + 0.4 * madness;
             },
         }
-        
-        // EXPLOSIVE global dynamic effects
-        let global_pulse = 1.0 + 0.6 * (2.0 * std::f32::consts::PI * 1.5 * time).sin().abs();
-        let global_wave = 1.0 + 0.3 * (2.0 * std::f32::consts::PI * 0.2 * time).sin();
-        params.brightness *= global_pulse;
-        params.contrast *= global_wave;
-        
-        // EXPLOSIVE energy-driven effects
-        if self.energy_level > 0.6 {
-            params.contrast *= 2.0;
-            params.saturation *= 1.8;
-            params.amplitude *= 1.5;
+
+        // Energy-driven reactive effects
+        let energy_factor = self.energy_level.powf(1.5);
+        params.brightness *= 0.9 + energy_factor * 0.3;
+        params.contrast *= 0.95 + energy_factor * 0.2;
+
+        // High energy boost
+        if self.energy_level > 0.7 {
+            params.contrast *= 1.3;
+            params.saturation *= 1.2;
+            params.amplitude *= 1.2;
         }
-        
-        // EXPLOSIVE burst effects
-        let burst = if (time % 1.0) > 0.95 { 2.0 } else { 1.0 }; // Burst every second
-        params.frequency *= burst;
-        params.speed *= burst;
-        
+
+        // Subtle burst on beat alignment (using seed for unique timing)
+        let burst_phase = (time * self.bpm / 60.0 + seed_offset) % 4.0;
+        if burst_phase > 3.8 {
+            params.frequency *= 1.3;
+            params.brightness *= 1.2;
+        }
+
         params
     }
 }
