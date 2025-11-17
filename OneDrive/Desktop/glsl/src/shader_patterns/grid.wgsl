@@ -9,8 +9,8 @@ fn grid_pattern(uv: vec2<f32>, time: f32) -> vec2<f32> {
     
     // Only show grid lines, not fill squares
     let line_thickness = 0.15;
-    let x_line = smoothstep(line_thickness, 0.0, abs(grid_x));
-    let y_line = smoothstep(line_thickness, 0.0, abs(grid_y));
+    let x_line = 1.0 - smoothstep(0.0, line_thickness, abs(grid_x));
+    let y_line = 1.0 - smoothstep(0.0, line_thickness, abs(grid_y));
     
     let grid_strength = max(x_line, y_line);
     
